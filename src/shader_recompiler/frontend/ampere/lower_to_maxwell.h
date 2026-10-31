@@ -137,7 +137,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
         case 0x88c: case 0x887: case 0x958: case 0xabb:
             uses_extended_uniform_bank |= extended_uniform(instruction.Bits(24, 8));
             break;
-        case 0xc0b: case 0xc0c: case 0xc10: case 0xc11: case 0xc12: case 0xc17: case 0xc19: case 0xc20: case 0xc24: case 0xd06:
+        case 0xc0a: case 0xc0b: case 0xc0c: case 0xc10: case 0xc11: case 0xc12: case 0xc17: case 0xc19: case 0xc20: case 0xc24: case 0xd06:
         case 0xc45: case 0xd08: case 0xc82: case 0xc02: case 0xd00: case 0xd09: case 0xe21: case 0xe23:
         case 0xe24: case 0xc23: case 0x2bd:
             uses_extended_uniform_bank |= extended_uniform(instruction.Bits(32, 8));
@@ -156,7 +156,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
             break;
         default: break;
         }
-        uses_uniform_bank |= op == 0xf60 || op == 0xc13 || op == 0xc19 || op == 0xd06 || op == 0x2a5 || op == 0xd05 || op == 0xc09 || op == 0xf63 || op == 0xf66 || op == 0xd08 || (op == 0x83b && instruction.Bits(91, 1)) || op == 0x2be || op == 0x526 || op == 0x988 || (op == 0x984 && instruction.Bits(91, 1)) || op == 0xc11 || op == 0x883 || (op == 0x98e && instruction.Bits(91, 1)) || op == 0x291 || op == 0x896 || op == 0x892 || op == 0x89c || op == 0x3c4 || op == 0x2bd || op == 0xc10 || op == 0xc0b || op == 0xc0c || op == 0x986 || op == 0x981 || op == 0x9a8 || op == 0xc12 || op == 0xc17 || op == 0xe24 || op == 0xc24 || op == 0xd00 || op == 0xd09 || op == 0x9c3 || op == 0xc45 || op == 0x2a4 || op == 0x8a4 || op == 0x891 || op == 0x890 || op == 0x290 || op == 0x28c || op == 0x88c || op == 0x287 || op == 0x887 || op == 0x958 || op == 0xab9 || op == 0xabb || op == 0x899 || op == 0xc20 || op == 0xe21 || op == 0xc23 || op == 0xe23 || op == 0xc02 || op == 0x292 || op == 0x299 ||
+        uses_uniform_bank |= op == 0xf60 || op == 0xc13 || op == 0xc19 || op == 0xd06 || op == 0x2a5 || op == 0xd05 || op == 0xc09 || op == 0xf63 || op == 0xf66 || op == 0xd08 || (op == 0x83b && instruction.Bits(91, 1)) || op == 0x2be || op == 0x526 || op == 0x988 || (op == 0x984 && instruction.Bits(91, 1)) || op == 0xc11 || op == 0x883 || (op == 0x98e && instruction.Bits(91, 1)) || op == 0x291 || op == 0x896 || op == 0x892 || op == 0x89c || op == 0x3c4 || op == 0x2bd || op == 0xc10 || op == 0xc0a || op == 0xc0b || op == 0xc0c || op == 0x986 || op == 0x981 || op == 0x9a8 || op == 0xc12 || op == 0xc17 || op == 0xe24 || op == 0xc24 || op == 0xd00 || op == 0xd09 || op == 0x9c3 || op == 0xc45 || op == 0x2a4 || op == 0x8a4 || op == 0x891 || op == 0x890 || op == 0x290 || op == 0x28c || op == 0x88c || op == 0x287 || op == 0x887 || op == 0x958 || op == 0xab9 || op == 0xabb || op == 0x899 || op == 0xc20 || op == 0xe21 || op == 0xc23 || op == 0xe23 || op == 0xc02 || op == 0x292 || op == 0x299 ||
                              op == 0x886 || op == 0x3c2 || op == 0xc82 || op == 0x882 || (op == 0x81c && instruction.Bits(67, 1));
     }
     const bool uses_async_copy = std::any_of(code.begin(), code.end(), [](const auto& instruction) {
@@ -1199,11 +1199,15 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
             break;
         }
         case 0x299: { // USHF.L.W.U32.HI Ud, URZ, Us, Uc: Ud = Uc << (Us & 31), register shift amount
-            const u32 high = insn.Bits(64, 8);
+            // Without .HI and with a URZ high word (Fire Emblem's compute shaders), the low word is
+            // shifted the same way: Ud = Ua << (Us & 31) or Ua >> (Us & 31).
+            const bool low_result = insn.Bits(64, 8) == 63 && insn.Bits(24, 8) < 63 &&
+                                    (insn.words[2] == 0x08000e3fU || insn.words[2] == 0x08001e3fU);
+            const u32 high = low_result ? insn.Bits(24, 8) : insn.Bits(64, 8);
             const u32 source = uniform_register(insn.words[1]), carrier = uniform_register(high);
             // Bit 76 selects USHF.R.W.U32.HI: Ud = Uc >> (Us & 31).
-            const bool right = insn.words[2] == (0x08011e00U | high);
-            if (insn.Bits(24, 8) != 63 || (insn.words[2] != (0x08010e00U | high) && !right) || dest >= 63 ||
+            const bool right = low_result ? insn.Bits(76, 1) != 0 : insn.words[2] == (0x08011e00U | high);
+            if ((!low_result && (insn.Bits(24, 8) != 63 || (insn.words[2] != (0x08010e00U | high) && !right))) || dest >= 63 ||
                 insn.words[1] >= 64 || source == ~0U || carrier == ~0U || native_predicate != 7)
                 return fail(index, "native uniform shift mode");
             emit((right ? 0x5c28000000070000ULL : 0x5c48000000070000ULL) | uniform_register(static_cast<u32>(dest)) | (u64{carrier} << 8) |
@@ -1549,11 +1553,14 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
             if ((opcode != 0xa19 && insn.words[1] > 255) || shift == ~0U ||
                 (opcode == 0xa19 && insn.Bits(62, 2)) || insn.Bits(73, 2) != 3 ||
                 (insn.words[2] & ~(0x000118ffU | (opcode == 0xc19 ? 0x08000000U : 0U))) != 0x00000600U ||
-                (right ? (!high_result || low != 255) : (high_result || high != 255)))
+                (right ? (high_result && low != 255) : (high_result || high != 255)))
                 return fail(index, "native register shift mode");
+            // Maxwell SHF.R yields the low word of {Rc:Ra} >> shift, so SHF.R without .HI maps
+            // directly (Fire Emblem's map shaders use it as a plain logical right shift).
+            const bool right_low = right && !high_result;
             emit(base(right ? 0x5cf8000000000000ULL : 0x5bf8000000000000ULL) |
-                (u64{right ? high : 255U} << 8) | (u64{shift} << 20) |
-                (u64{right ? 255U : low} << 39) | (u64{insn.Bits(75, 1)} << 50));
+                (u64{right ? (right_low ? low : high) : 255U} << 8) | (u64{shift} << 20) |
+                (u64{right ? (right_low ? high : 255U) : low} << 39) | (u64{insn.Bits(75, 1)} << 50));
             break;
         }
         case 0x300: case 0xd00: { // FLO, including a uniform source.
@@ -2162,11 +2169,34 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                      250 + component);
             break;
         }
-        case 0xf60: { // Scalar 2D sample with a uniform bindless descriptor handle.
+        case 0xf60: { // Scalar 2D, 3D or cube sample with a uniform bindless descriptor handle.
             const u32 a = insn.Bits(24, 8), b = insn.Bits(32, 8);
             const u32 handle = uniform_register(insn.Bits(40, 6));
             const u32 mask = insn.Bits(72, 4), count = std::popcount(mask), second = insn.Bits(64, 8);
             const u32 sample_lod = insn.Bits(87, 3); // explicit zero-LOD form
+            const u32 dimension = insn.Bits(61, 3);
+            if (dimension == 2 || dimension == 3) {
+                // 3D or cube (Fire Emblem's map compute shaders): XY in a pair, Z in Rb.
+                if (!insn.Bits(60, 1) || insn.Bits(46, 14) || sample_lod > 1 ||
+                    (insn.words[2] & ~(0x04000000U | 0x00800000U | 0xfffU)) != 0x081e0000 || !mask ||
+                    handle == ~0U || (a & 1) || a + 1 >= reserved_register || b >= reserved_register ||
+                    dest >= reserved_register ||
+                    (count > 1 && ((dest & 1) || dest + 1 >= reserved_register)) ||
+                    (count <= 2 ? second != 255 : second >= reserved_register) ||
+                    (count == 4 && ((second & 1) || second + 1 >= reserved_register)))
+                    return fail(index, "native uniform-handle volume texture sample mode");
+                const auto copy = [&](u32 target, u32 source) {
+                    emit(0x5c98000000000000ULL | predicate | target | (u64{15} << 39) | (u64{source} << 20));
+                };
+                copy(252, a); copy(253, a + 1); copy(254, b);
+                emit(0xde80000000000000ULL | predicate | 250 | (u64{252} << 8) |
+                     (u64{handle} << 20) | (u64{dimension == 3 ? 6U : 4U} << 28) | (u64{mask} << 31) |
+                     (u64{sample_lod} << 37) | (u64{7} << 51) | (u64{insn.Bits(90, 1)} << 49));
+                for (u32 component = 0; component < count; ++component)
+                    copy(component < 2 ? static_cast<u32>(dest) + component : second + component - 2,
+                         250 + component);
+                break;
+            }
             if ((insn.words[1] & ~0x3fffU) != 0x30000000 || sample_lod > 1 ||
                 (insn.words[2] & ~(0x04000000U | 0x00800000U | 0xfffU)) != 0x081e0000 || !mask ||
                 handle == ~0U || a >= reserved_register || b >= reserved_register || dest >= reserved_register ||
@@ -2983,10 +3013,12 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                 (u64{insn.Bits(87, 3)} << 39) | (u64{insn.Bits(90, 1)} << 42));
             break;
         }
-        case 0x20a: case 0x80a: case 0xa0a: { // FSET.BF, combined with a predicate (AND/OR/XOR)
+        case 0x20a: case 0x80a: case 0xa0a: case 0xc0a: { // FSET.BF, combined with a predicate (AND/OR/XOR)
             // The combine predicate (bits 87-90) and operation (bits 74-75) map directly onto
-            // Maxwell FSET; this covers the FastFusion PT-OR form as well.
-            if (insn.Bits(64, 8) || insn.Bits(74, 2) == 3 || insn.Bits(81, 6) || insn.Bits(91, 1))
+            // Maxwell FSET; this covers the FastFusion PT-OR form as well. 0xc0a (Fire Emblem)
+            // takes the second source from a uniform register, marked by bit 91.
+            if (insn.Bits(64, 8) || insn.Bits(74, 2) == 3 || insn.Bits(81, 6) ||
+                insn.Bits(91, 1) != (opcode == 0xc0a ? 1U : 0U))
                 return fail(index, "native floating comparison output mode");
             const u32 a = operand(0), b = operand(1);
             emit(base(0x5800000000000000ULL) | (u64{a} << 8) | (u64{b} << 20) |
@@ -3640,7 +3672,9 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                     (inplace_link && relocation.target > active_entry && relocation.target < index &&
                      relocation.output_index < result.source_instruction_offsets[active_entry]) ||
                     relocation.target == index ||
-                    (relocation.target == index - 1 && (!inplace_link ||
+                    // A call may enter a callee whose whole body is the upper-link setup (Fire Emblem).
+                    (relocation.target == index - 1 && !(relocation.call && relocation.target == active_entry) &&
+                     (!inplace_link ||
                      relocation.output_index < result.source_instruction_offsets[active_entry])))
                     return fail(index, "native branch bypasses return linkage");
             }
