@@ -2099,6 +2099,11 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
     ASSERT_MSG(cpu_addr, "Tried to insert an image to an invalid gpu_addr={:#x}", gpu_addr);
     ImageInfo storage_info = info;
     storage_info.native_tiling = gpu_memory->UsesNativeTiling();
+    // Fire Emblem makes a 0x864 depth image; creating a zero-sized image aborts.
+    if (storage_info.size.width == 0 || storage_info.size.height == 0) {
+        storage_info.size.width = (std::max)(storage_info.size.width, 1U);
+        storage_info.size.height = (std::max)(storage_info.size.height, 1U);
+    }
     const ImageId image_id = JoinImages(storage_info, gpu_addr, *cpu_addr);
     const Image& image = slot_images[image_id];
     // Using "image.gpu_addr" instead of "gpu_addr" is important because it might be different

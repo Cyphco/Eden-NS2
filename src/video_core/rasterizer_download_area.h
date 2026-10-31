@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include "common/common_types.h"
 
 namespace VideoCore {
@@ -12,5 +13,9 @@ struct RasterizerDownloadArea {
     VAddr end_address;
     bool preemtive;
 };
+
+/// Bumped when guest CPU reads of areas handed out before must be reported again: the buffer
+/// cache copies GPU writes back only to pages read since their last copy.
+inline std::atomic<u64> read_area_generation{};
 
 } // namespace VideoCore

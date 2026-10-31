@@ -15234,7 +15234,7 @@ index ea1d1c9..7e3b9a5 100644
      return load_base + image_size;
  }
 diff --git a/src/core/memory.cpp b/src/core/memory.cpp
-index eabc6df..bafe965 100644
+index eabc6df..980e9c4 100644
 --- a/src/core/memory.cpp
 +++ b/src/core/memory.cpp
 @@ -5,7 +5,9 @@
@@ -15431,6 +15431,34 @@ index eabc6df..bafe965 100644
              return Common::AtomicCompareAndSwap(reinterpret_cast<u64*>(ptr), data, expected);
          }
          return true;
+@@ -686,13 +785,17 @@ struct Memory::Impl {
+         }
+         const size_t core = system.GetCurrentHostThreadID();
+         auto& current_area = rasterizer_read_areas[core];
++        auto& current_generation = rasterizer_read_generations[core];
+         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
+             const DAddr end_address = address + size;
+-            if (current_area.start_address <= address && end_address <= current_area.end_address)
+-                [[likely]] {
++            const u64 generation =
++                VideoCore::read_area_generation.load(std::memory_order_relaxed);
++            if (current_area.start_address <= address && end_address <= current_area.end_address &&
++                current_generation == generation) [[likely]] {
+                 return;
+             }
+             current_area = system.GPU().OnCPURead(address, size);
++            current_generation = generation;
+         });
+     }
+ 
+@@ -765,6 +868,7 @@ struct Memory::Impl {
+     Common::PageTable* current_page_table = nullptr;
+ 
+     std::array<VideoCore::RasterizerDownloadArea, Core::Hardware::NUM_CPU_CORES> rasterizer_read_areas{};
++    std::array<u64, Core::Hardware::NUM_CPU_CORES> rasterizer_read_generations{};
+     std::array<GPUDirtyState, Core::Hardware::NUM_CPU_CORES> rasterizer_write_areas{};
+     std::array<Common::ScratchBuffer<u32>, Core::Hardware::NUM_CPU_CORES> scratch_buffers{};
+     std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers;
 diff --git a/src/core/memory.h b/src/core/memory.h
 index 7167efb..204b751 100644
 --- a/src/core/memory.h
@@ -43445,7 +43473,7 @@ index 64d14ab..d54a141 100644
      texture_cache/image_view_base.h
      texture_cache/image_view_info.cpp
 diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
-index f30c859..9db5ab1 100644
+index f30c859..2fb0905 100644
 --- a/src/video_core/buffer_cache/buffer_cache.h
 +++ b/src/video_core/buffer_cache/buffer_cache.h
 @@ -9,11 +9,20 @@
@@ -43655,7 +43683,22 @@ index f30c859..9db5ab1 100644
      channel_state->enabled_compute_texture_buffers |= 1U << tbo_index;
      channel_state->written_compute_texture_buffers |= (is_written ? 1U : 0U) << tbo_index;
      if constexpr (SEPARATE_IMAGE_BUFFERS_BINDINGS) {
-@@ -649,6 +732,8 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
+@@ -590,6 +673,14 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
+         async_buffers.emplace_back(std::optional<Async_Buffer>{});
+         return;
+     }
++    if (!AsyncBufferDownloads()) {
++        for (const auto& range_set : committed_gpu_modified_ranges) {
++            range_set.ForEach([this](DAddr start, DAddr end) {
++                cpu_read_ranges.Subtract(start, end - start);
++            });
++        }
++        VideoCore::read_area_generation.fetch_add(1, std::memory_order_relaxed);
++    }
+ 
+     auto it = committed_gpu_modified_ranges.begin();
+     while (it != committed_gpu_modified_ranges.end()) {
+@@ -649,6 +740,8 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
          async_buffers.emplace_back(std::optional<Async_Buffer>{});
          return;
      }
@@ -43664,7 +43707,7 @@ index f30c859..9db5ab1 100644
      auto download_staging = runtime.DownloadStagingBuffer(total_size_bytes, true);
      boost::container::small_vector<BufferCopy, 4> normalized_copies;
      runtime.PreCopyBarrier();
-@@ -659,6 +744,19 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
+@@ -659,6 +752,19 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
          Buffer& buffer = slot_buffers[buffer_id];
          second_copy.src_offset = static_cast<size_t>(buffer.CpuAddr()) + copy.src_offset;
          const DAddr orig_device_addr = static_cast<DAddr>(second_copy.src_offset);
@@ -43684,7 +43727,7 @@ index f30c859..9db5ab1 100644
          async_downloads.Add(orig_device_addr, copy.size);
          buffer.MarkUsage(copy.src_offset, copy.size);
          runtime.CopyBuffer(download_staging.buffer, buffer, copies, false);
-@@ -711,9 +809,28 @@ void BufferCache<P>::PopAsyncBuffers() {
+@@ -711,9 +817,32 @@ void BufferCache<P>::PopAsyncBuffers() {
  
  template <class P>
  bool BufferCache<P>::IsRegionGpuModified(DAddr addr, size_t size) {
@@ -43707,6 +43750,10 @@ index f30c859..9db5ab1 100644
 +        return;
 +    }
 +    cpu_read_ranges.Add(addr, size);
++    // What the GPU wrote there before this read is copied back at the next fence too.
++    gpu_modified_ranges.ForEachInRange(addr, size, [this](DAddr start, DAddr end) {
++        uncommitted_gpu_modified_ranges.Add(start, end - start);
++    });
 +    if (Nx2Profile::Enabled()) {
 +        static u64 noted{};
 +        if ((++noted & 255) == 1) {
@@ -43716,7 +43763,7 @@ index f30c859..9db5ab1 100644
  }
  
  template <class P>
-@@ -930,6 +1047,23 @@ void BufferCache<P>::BindHostGraphicsUniformBuffers(size_t stage) {
+@@ -930,6 +1059,23 @@ void BufferCache<P>::BindHostGraphicsUniformBuffers(size_t stage) {
  template <class P>
  void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 binding_index, bool needs_bind) {
      ++channel_state->uniform_cache_shots[0];
@@ -43740,7 +43787,7 @@ index f30c859..9db5ab1 100644
      const Binding& binding = channel_state->uniform_buffers[stage][index];
      const DAddr device_addr = binding.device_addr;
      const u32 size = (std::min)(binding.size, (*channel_state->uniform_buffer_sizes)[stage][index]);
-@@ -1006,11 +1140,82 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
+@@ -1006,11 +1152,82 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32
      channel_state->fast_bound_uniform_buffers[stage] &= ~(1u << binding_index);
  }
  
@@ -43824,7 +43871,7 @@ index f30c859..9db5ab1 100644
      if constexpr (requires { runtime.BindMultiRangeStorageBuffer(u64{}, bool{}); }) {
          if (binding.gpu_addr == 0 || binding.size == 0) {
              return;
-@@ -1054,7 +1259,9 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
+@@ -1054,7 +1271,9 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
          if (binding.segment_first + binding.segment_count > pool.size()) {
              return false;
          }
@@ -43835,7 +43882,7 @@ index f30c859..9db5ab1 100644
          runtime.ResetMultiRange();
          for (u32 index = 0; index < binding.segment_count; ++index) {
              const MultiRangeSegment& segment = pool[binding.segment_first + index];
-@@ -1070,6 +1277,10 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
+@@ -1070,6 +1289,10 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
              }
              runtime.PushMultiRangeSource(buffer, offset, segment.size);
          }
@@ -43846,7 +43893,7 @@ index f30c859..9db5ab1 100644
          return runtime.BindMultiRangeStorageBuffer(key, is_written);
      } else {
          return false;
-@@ -1194,8 +1405,15 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
+@@ -1194,8 +1417,15 @@ void BufferCache<P>::BindHostComputeUniformBuffers() {
                  return alignment > 1 && (offset % alignment) != 0;
              }
          }();
@@ -43863,7 +43910,7 @@ index f30c859..9db5ab1 100644
                  const std::span<u8> span =
                      runtime.BindMappedUniformBuffer(0, binding_index, size);
                  device_memory.ReadBlockUnsafe(binding.device_addr, span.data(), size);
-@@ -1292,6 +1510,17 @@ void BufferCache<P>::DoUpdateGraphicsBuffers(bool is_indexed) {
+@@ -1292,6 +1522,17 @@ void BufferCache<P>::DoUpdateGraphicsBuffers(bool is_indexed) {
          if (current_draw_indirect) {
              UpdateDrawIndirect();
          }
@@ -43881,7 +43928,7 @@ index f30c859..9db5ab1 100644
      });
  }
  
-@@ -1302,6 +1531,16 @@ void BufferCache<P>::DoUpdateComputeBuffers() {
+@@ -1302,6 +1543,16 @@ void BufferCache<P>::DoUpdateComputeBuffers() {
          UpdateComputeUniformBuffers();
          UpdateComputeStorageBuffers();
          UpdateComputeTextureBuffers();
@@ -43898,7 +43945,7 @@ index f30c859..9db5ab1 100644
      });
  }
  
-@@ -1372,7 +1611,12 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
+@@ -1372,7 +1623,12 @@ void BufferCache<P>::UpdateVertexBuffer(u32 index) {
      const auto& array = maxwell3d->regs.vertex_streams[index];
      const auto& limit = maxwell3d->regs.vertex_stream_limits[index];
      const GPUVAddr gpu_addr_begin = array.Address();
@@ -43912,7 +43959,7 @@ index f30c859..9db5ab1 100644
      const std::optional<DAddr> device_addr = gpu_memory->GpuToCpuAddress(gpu_addr_begin);
      const u32 address_size = static_cast<u32>(gpu_addr_end - gpu_addr_begin);
      u32 size = address_size; // TODO: Analyze stride and number of vertices
-@@ -1419,6 +1663,7 @@ void BufferCache<P>::UpdateDrawIndirect() {
+@@ -1419,6 +1675,7 @@ void BufferCache<P>::UpdateDrawIndirect() {
  template <class P>
  void BufferCache<P>::UpdateUniformBuffers(size_t stage) {
      ForEachEnabledBit(channel_state->enabled_uniform_buffer_masks[stage], [&](u32 index) {
@@ -43920,7 +43967,7 @@ index f30c859..9db5ab1 100644
          Binding& binding = channel_state->uniform_buffers[stage][index];
          if (binding.buffer_id) {
              // Already updated
-@@ -1438,6 +1683,9 @@ void BufferCache<P>::UpdateStorageBuffers(size_t stage) {
+@@ -1438,6 +1695,9 @@ void BufferCache<P>::UpdateStorageBuffers(size_t stage) {
      ForEachEnabledBit(channel_state->enabled_storage_buffers[stage], [&](u32 index) {
          // Resolve buffer
          Binding& binding = channel_state->storage_buffers[stage][index];
@@ -43930,7 +43977,7 @@ index f30c859..9db5ab1 100644
          const BufferId buffer_id = FindBuffer(binding.device_addr, binding.size, false);
          binding.buffer_id = buffer_id;
          const bool is_written = ((channel_state->written_storage_buffers[stage] >> index) & 1) != 0;
-@@ -1504,6 +1752,9 @@ void BufferCache<P>::UpdateComputeStorageBuffers() {
+@@ -1504,6 +1764,9 @@ void BufferCache<P>::UpdateComputeStorageBuffers() {
      ForEachEnabledBit(channel_state->enabled_compute_storage_buffers, [&](u32 index) {
          // Resolve buffer
          Binding& binding = channel_state->compute_storage_buffers[index];
@@ -43940,7 +43987,7 @@ index f30c859..9db5ab1 100644
          binding.buffer_id = FindBuffer(binding.device_addr, binding.size, false);
          const bool is_written =
              ((channel_state->written_compute_storage_buffers >> index) & 1) != 0;
-@@ -1529,7 +1780,10 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
+@@ -1529,7 +1792,10 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
      }
      memory_tracker.MarkRegionAsGpuModified(device_addr, size);
      gpu_modified_ranges.Add(device_addr, size);
@@ -43952,7 +43999,7 @@ index f30c859..9db5ab1 100644
  }
  
  template <class P>
-@@ -1710,9 +1964,11 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
+@@ -1710,9 +1976,11 @@ void BufferCache<P>::ChangeRegister(BufferId buffer_id) {
      Buffer& buffer = slot_buffers[buffer_id];
      const auto size = buffer.SizeBytes();
      if (insert) {
@@ -43964,7 +44011,7 @@ index f30c859..9db5ab1 100644
          total_used_memory -= Common::AlignUp(size, 1024);
          lru_cache.Free(buffer.getLRUID());
      }
-@@ -1902,6 +2158,52 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer) {
+@@ -1902,6 +2170,52 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer) {
      DownloadBufferMemory(buffer, buffer.CpuAddr(), buffer.SizeBytes());
  }
  
@@ -44017,7 +44064,7 @@ index f30c859..9db5ab1 100644
  template <class P>
  void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64 size) {
      boost::container::small_vector<BufferCopy, 1> copies;
-@@ -2030,28 +2332,63 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
+@@ -2030,28 +2344,63 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
      channel_state->has_deleted_buffers = true;
  }
  
@@ -44096,7 +44143,7 @@ index f30c859..9db5ab1 100644
      // Alignment only applies to the offset of the buffer
      const u32 alignment = runtime.GetStorageBufferAlignment();
 diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
-index 26bf3dd..739e04a 100644
+index 26bf3dd..74a5501 100644
 --- a/src/video_core/buffer_cache/buffer_cache_base.h
 +++ b/src/video_core/buffer_cache/buffer_cache_base.h
 @@ -7,6 +7,8 @@
@@ -44209,7 +44256,7 @@ index 26bf3dd..739e04a 100644
  
      [[nodiscard]] TextureBufferBinding GetTextureBufferBinding(GPUVAddr gpu_addr, u32 size,
                                                                 PixelFormat format);
-@@ -513,8 +539,43 @@ private:
+@@ -513,8 +539,46 @@ private:
  
      MemoryTracker memory_tracker;
      Common::RangeSet<DAddr> uncommitted_gpu_modified_ranges;
@@ -44238,6 +44285,9 @@ index 26bf3dd..739e04a 100644
 +    /// constants from values the GPU computes, and drew a black, flickering sky without them.
 +    /// Copying every GPU-written range back instead (each written native storage binding is an
 +    /// 8 MiB window) dropped it from 60 to about 42 frames a second.
++    /// Only pages read since they were last copied back are kept: Fire Emblem reads its pages
++    /// 10-40 times a second, but with a fence per compute dispatch they were copied back about
++    /// 10000 times a second (3.5 GB/s, a fifth of its frame rate).
 +    Common::RangeSet<DAddr> cpu_read_ranges;
 +
 +    /// Queues the parts of a GPU write to [addr, addr + size) that are copied back at the next fence.
@@ -44253,7 +44303,7 @@ index 26bf3dd..739e04a 100644
  
      // Async Buffers
      Common::OverlapRangeSet<DAddr> async_downloads;
-@@ -533,10 +594,22 @@ private:
+@@ -533,10 +597,22 @@ private:
      };
      Common::LeastRecentlyUsedCache<LRUItemParams> lru_cache;
      VirtualRangeCache virtual_ranges;
@@ -44276,7 +44326,7 @@ index 26bf3dd..739e04a 100644
      u64 minimum_memory = 0;
      u64 critical_memory = 0;
      BufferId inline_buffer_id;
-@@ -544,7 +617,8 @@ private:
+@@ -544,7 +620,8 @@ private:
      bool immediately_free = false;
  #endif
  
@@ -52320,6 +52370,27 @@ index d73e903..0e345a8 100644
      struct QueryCacheBaseImpl;
      friend struct QueryCacheBaseImpl;
      friend RuntimeType;
+diff --git a/src/video_core/rasterizer_download_area.h b/src/video_core/rasterizer_download_area.h
+index d288260..2ca4cce 100644
+--- a/src/video_core/rasterizer_download_area.h
++++ b/src/video_core/rasterizer_download_area.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include "common/common_types.h"
+ 
+ namespace VideoCore {
+@@ -13,4 +14,8 @@ struct RasterizerDownloadArea {
+     bool preemtive;
+ };
+ 
++/// Bumped when guest CPU reads of areas handed out before must be reported again: the buffer
++/// cache copies GPU writes back only to pages read since their last copy.
++inline std::atomic<u64> read_area_generation{};
++
+ } // namespace VideoCore
 diff --git a/src/video_core/rasterizer_interface.h b/src/video_core/rasterizer_interface.h
 index b527c0e..b08bd27 100644
 --- a/src/video_core/rasterizer_interface.h
@@ -57248,7 +57319,7 @@ index 0000000..52a48e8
 +
 +} // namespace VideoCommon
 diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
-index e92e54f..693849a 100644
+index e92e54f..55346b5 100644
 --- a/src/video_core/texture_cache/texture_cache.h
 +++ b/src/video_core/texture_cache/texture_cache.h
 @@ -6,7 +6,14 @@
@@ -58155,7 +58226,7 @@ index e92e54f..693849a 100644
          auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
          std::memcpy(staging.mapped_span.data(), async_decode->decoded_data.data(),
                      async_decode->decoded_data.size());
-@@ -1512,21 +2069,37 @@ bool TextureCache<P>::ScaleDown(Image& image) {
+@@ -1512,21 +2069,42 @@ bool TextureCache<P>::ScaleDown(Image& image) {
      return true;
  }
  
@@ -58198,11 +58269,16 @@ index e92e54f..693849a 100644
 -    const ImageId image_id = JoinImages(info, gpu_addr, *cpu_addr);
 +    ImageInfo storage_info = info;
 +    storage_info.native_tiling = gpu_memory->UsesNativeTiling();
++    // Fire Emblem makes a 0x864 depth image; creating a zero-sized image aborts.
++    if (storage_info.size.width == 0 || storage_info.size.height == 0) {
++        storage_info.size.width = (std::max)(storage_info.size.width, 1U);
++        storage_info.size.height = (std::max)(storage_info.size.height, 1U);
++    }
 +    const ImageId image_id = JoinImages(storage_info, gpu_addr, *cpu_addr);
      const Image& image = slot_images[image_id];
      // Using "image.gpu_addr" instead of "gpu_addr" is important because it might be different
      const auto [it, is_new] = image_allocs_table.try_emplace(image.gpu_addr);
-@@ -1634,10 +2207,44 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+@@ -1634,10 +2212,44 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
          }
      }
  
@@ -58247,7 +58323,7 @@ index e92e54f..693849a 100644
  
      if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes) &&
          new_info.is_sparse) {
-@@ -1647,7 +2254,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+@@ -1647,7 +2259,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
      for (const ImageId overlap_id : join_ignore_textures) {
          Image& overlap = slot_images[overlap_id];
          if (True(overlap.flags & ImageFlagBits::GpuModified)) {
@@ -58260,7 +58336,7 @@ index e92e54f..693849a 100644
          }
          if (True(overlap.flags & ImageFlagBits::Tracked)) {
              UntrackImage(overlap, overlap_id);
-@@ -1833,12 +2444,9 @@ std::optional<typename TextureCache<P>::BlitImages> TextureCache<P>::GetBlitImag
+@@ -1833,12 +2449,9 @@ std::optional<typename TextureCache<P>::BlitImages> TextureCache<P>::GetBlitImag
  
  template <class P>
  ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr) {
@@ -58275,7 +58351,7 @@ index e92e54f..693849a 100644
      }
      ImageId image_id{};
      boost::container::small_vector<ImageId, 8> image_ids;
-@@ -1859,6 +2467,13 @@ ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr)
+@@ -1859,6 +2472,13 @@ ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr)
                  return true;
              }
          } else if (IsSubCopy(info, existing_image, gpu_addr)) {
@@ -58289,7 +58365,7 @@ index e92e54f..693849a 100644
              image_id = existing_image_id;
              image_ids.push_back(existing_image_id);
              return true;
-@@ -1954,6 +2569,13 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
+@@ -1954,6 +2574,13 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
          base = image.TryFindBase(gpu_addr).value();
      }
      const s32 layers = image.info.type == ImageType::e3D ? info.size.depth : info.resources.layers;
@@ -58303,7 +58379,7 @@ index e92e54f..693849a 100644
      const SubresourceRange range{
          .base = base,
          .extent = {.levels = 1, .layers = layers},
-@@ -2136,6 +2758,13 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
+@@ -2136,6 +2763,13 @@ ImageViewId TextureCache<P>::FindOrEmplaceImageView(ImageId image_id, const Imag
      if (const ImageViewId image_view_id = image.FindView(info); image_view_id) {
          return image_view_id;
      }
@@ -58317,7 +58393,7 @@ index e92e54f..693849a 100644
      const ImageViewId image_view_id = slot_image_views.insert(runtime, info, image_id, image, slot_images);
      image.InsertView(info, image_view_id);
      return image_view_id;
-@@ -2147,13 +2776,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
+@@ -2147,13 +2781,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
      ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                 "Trying to register an already registered image");
      image.flags |= ImageFlagBits::Registered;
@@ -58332,7 +58408,7 @@ index e92e54f..693849a 100644
      image.lru_index = lru_cache.Insert(image_id, frame_tick);
  
      ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, image_id](u64 page) {
-@@ -2291,9 +2914,185 @@ void TextureCache<P>::TrackImage(ImageBase& image, ImageId image_id) {
+@@ -2291,9 +2919,185 @@ void TextureCache<P>::TrackImage(ImageBase& image, ImageId image_id) {
                           });
  }
  
@@ -58518,7 +58594,7 @@ index e92e54f..693849a 100644
      image.flags &= ~ImageFlagBits::Tracked;
      if (False(image.flags & ImageFlagBits::Sparse)) {
          if (image.cpu_addr < ~(1ULL << 40)) {
-@@ -2316,16 +3115,29 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
+@@ -2316,16 +3120,29 @@ void TextureCache<P>::UntrackImage(ImageBase& image, ImageId image_id) {
  template <class P>
  void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
      ImageBase& image = slot_images[image_id];
@@ -58555,7 +58631,7 @@ index e92e54f..693849a 100644
      const GPUVAddr gpu_addr = image.gpu_addr;
      const auto alloc_it = image_allocs_table.find(gpu_addr);
      if (alloc_it == image_allocs_table.end()) {
-@@ -2385,7 +3197,11 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
+@@ -2385,7 +3202,11 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
          }
          slot_image_views.erase(image_view_id);
      }
@@ -58568,7 +58644,7 @@ index e92e54f..693849a 100644
          sentenced_images.Push(std::move(slot_images[image_id]));
      }
      slot_images.erase(image_id);
-@@ -2504,6 +3320,8 @@ template <class P>
+@@ -2504,6 +3325,8 @@ template <class P>
  void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool invalidate) {
      Image& image = slot_images[image_id];
      if (invalidate) {
@@ -58577,7 +58653,7 @@ index e92e54f..693849a 100644
          image.flags &= ~(ImageFlagBits::CpuModified | ImageFlagBits::GpuModified);
          if (False(image.flags & ImageFlagBits::Tracked)) {
              TrackImage(image, image_id);
-@@ -2537,6 +3355,11 @@ template <class P>
+@@ -2537,6 +3360,11 @@ template <class P>
  void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<ImageCopy> copies) {
      Image& dst = slot_images[dst_id];
      Image& src = slot_images[src_id];
@@ -58589,7 +58665,7 @@ index e92e54f..693849a 100644
      const bool is_rescaled = True(src.flags & ImageFlagBits::Rescaled);
      if (is_rescaled) {
          ASSERT(True(dst.flags & ImageFlagBits::Rescaled));
-@@ -2628,7 +3451,8 @@ void TextureCache<P>::BindRenderTarget(ImageViewId* old_id, ImageViewId new_id)
+@@ -2628,7 +3456,8 @@ void TextureCache<P>::BindRenderTarget(ImageViewId* old_id, ImageViewId new_id)
      }
      if (new_id) {
          const ImageViewBase& old_view = slot_image_views[new_id];

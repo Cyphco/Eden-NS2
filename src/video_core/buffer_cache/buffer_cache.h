@@ -673,6 +673,14 @@ void BufferCache<P>::CommitAsyncFlushesHigh() {
         async_buffers.emplace_back(std::optional<Async_Buffer>{});
         return;
     }
+    if (!AsyncBufferDownloads()) {
+        for (const auto& range_set : committed_gpu_modified_ranges) {
+            range_set.ForEach([this](DAddr start, DAddr end) {
+                cpu_read_ranges.Subtract(start, end - start);
+            });
+        }
+        VideoCore::read_area_generation.fetch_add(1, std::memory_order_relaxed);
+    }
 
     auto it = committed_gpu_modified_ranges.begin();
     while (it != committed_gpu_modified_ranges.end()) {
@@ -825,6 +833,10 @@ void BufferCache<P>::NoteCpuRead(DAddr addr, size_t size) {
         return;
     }
     cpu_read_ranges.Add(addr, size);
+    // What the GPU wrote there before this read is copied back at the next fence too.
+    gpu_modified_ranges.ForEachInRange(addr, size, [this](DAddr start, DAddr end) {
+        uncommitted_gpu_modified_ranges.Add(start, end - start);
+    });
     if (Nx2Profile::Enabled()) {
         static u64 noted{};
         if ((++noted & 255) == 1) {

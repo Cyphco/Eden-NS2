@@ -785,13 +785,17 @@ struct Memory::Impl {
         }
         const size_t core = system.GetCurrentHostThreadID();
         auto& current_area = rasterizer_read_areas[core];
+        auto& current_generation = rasterizer_read_generations[core];
         gpu_device_memory->ApplyOpOnPointer(p, scratch_buffers[core], [&](DAddr address) {
             const DAddr end_address = address + size;
-            if (current_area.start_address <= address && end_address <= current_area.end_address)
-                [[likely]] {
+            const u64 generation =
+                VideoCore::read_area_generation.load(std::memory_order_relaxed);
+            if (current_area.start_address <= address && end_address <= current_area.end_address &&
+                current_generation == generation) [[likely]] {
                 return;
             }
             current_area = system.GPU().OnCPURead(address, size);
+            current_generation = generation;
         });
     }
 
@@ -864,6 +868,7 @@ struct Memory::Impl {
     Common::PageTable* current_page_table = nullptr;
 
     std::array<VideoCore::RasterizerDownloadArea, Core::Hardware::NUM_CPU_CORES> rasterizer_read_areas{};
+    std::array<u64, Core::Hardware::NUM_CPU_CORES> rasterizer_read_generations{};
     std::array<GPUDirtyState, Core::Hardware::NUM_CPU_CORES> rasterizer_write_areas{};
     std::array<Common::ScratchBuffer<u32>, Core::Hardware::NUM_CPU_CORES> scratch_buffers{};
     std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers;

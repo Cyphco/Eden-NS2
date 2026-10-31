@@ -564,6 +564,9 @@ private:
     /// constants from values the GPU computes, and drew a black, flickering sky without them.
     /// Copying every GPU-written range back instead (each written native storage binding is an
     /// 8 MiB window) dropped it from 60 to about 42 frames a second.
+    /// Only pages read since they were last copied back are kept: Fire Emblem reads its pages
+    /// 10-40 times a second, but with a fence per compute dispatch they were copied back about
+    /// 10000 times a second (3.5 GB/s, a fifth of its frame rate).
     Common::RangeSet<DAddr> cpu_read_ranges;
 
     /// Queues the parts of a GPU write to [addr, addr + size) that are copied back at the next fence.
