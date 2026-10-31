@@ -1548,11 +1548,14 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
             if ((opcode != 0xa19 && insn.words[1] > 255) || shift == ~0U ||
                 (opcode == 0xa19 && insn.Bits(62, 2)) || insn.Bits(73, 2) != 3 ||
                 (insn.words[2] & ~(0x000118ffU | (opcode == 0xc19 ? 0x08000000U : 0U))) != 0x00000600U ||
-                (right ? (!high_result || low != 255) : (high_result || high != 255)))
+                (right ? (high_result && low != 255) : (high_result || high != 255)))
                 return fail(index, "native register shift mode");
+            // Maxwell SHF.R yields the low word of {Rc:Ra} >> shift, so SHF.R without .HI maps
+            // directly (Fire Emblem's map shaders use it as a plain logical right shift).
+            const bool right_low = right && !high_result;
             emit(base(right ? 0x5cf8000000000000ULL : 0x5bf8000000000000ULL) |
-                (u64{right ? high : 255U} << 8) | (u64{shift} << 20) |
-                (u64{right ? 255U : low} << 39) | (u64{insn.Bits(75, 1)} << 50));
+                (u64{right ? (right_low ? low : high) : 255U} << 8) | (u64{shift} << 20) |
+                (u64{right ? (right_low ? high : 255U) : low} << 39) | (u64{insn.Bits(75, 1)} << 50));
             break;
         }
         case 0x300: case 0xd00: { // FLO, including a uniform source.
@@ -2161,11 +2164,34 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
                      250 + component);
             break;
         }
-        case 0xf60: { // Scalar 2D sample with a uniform bindless descriptor handle.
+        case 0xf60: { // Scalar 2D, 3D or cube sample with a uniform bindless descriptor handle.
             const u32 a = insn.Bits(24, 8), b = insn.Bits(32, 8);
             const u32 handle = uniform_register(insn.Bits(40, 6));
             const u32 mask = insn.Bits(72, 4), count = std::popcount(mask), second = insn.Bits(64, 8);
             const u32 sample_lod = insn.Bits(87, 3); // explicit zero-LOD form
+            const u32 dimension = insn.Bits(61, 3);
+            if (dimension == 2 || dimension == 3) {
+                // 3D or cube (Fire Emblem's map compute shaders): XY in a pair, Z in Rb.
+                if (!insn.Bits(60, 1) || insn.Bits(46, 14) || sample_lod > 1 ||
+                    (insn.words[2] & ~(0x04000000U | 0x00800000U | 0xfffU)) != 0x081e0000 || !mask ||
+                    handle == ~0U || (a & 1) || a + 1 >= reserved_register || b >= reserved_register ||
+                    dest >= reserved_register ||
+                    (count > 1 && ((dest & 1) || dest + 1 >= reserved_register)) ||
+                    (count <= 2 ? second != 255 : second >= reserved_register) ||
+                    (count == 4 && ((second & 1) || second + 1 >= reserved_register)))
+                    return fail(index, "native uniform-handle volume texture sample mode");
+                const auto copy = [&](u32 target, u32 source) {
+                    emit(0x5c98000000000000ULL | predicate | target | (u64{15} << 39) | (u64{source} << 20));
+                };
+                copy(252, a); copy(253, a + 1); copy(254, b);
+                emit(0xde80000000000000ULL | predicate | 250 | (u64{252} << 8) |
+                     (u64{handle} << 20) | (u64{dimension == 3 ? 6U : 4U} << 28) | (u64{mask} << 31) |
+                     (u64{sample_lod} << 37) | (u64{7} << 51) | (u64{insn.Bits(90, 1)} << 49));
+                for (u32 component = 0; component < count; ++component)
+                    copy(component < 2 ? static_cast<u32>(dest) + component : second + component - 2,
+                         250 + component);
+                break;
+            }
             if ((insn.words[1] & ~0x3fffU) != 0x30000000 || sample_lod > 1 ||
                 (insn.words[2] & ~(0x04000000U | 0x00800000U | 0xfffU)) != 0x081e0000 || !mask ||
                 handle == ~0U || a >= reserved_register || b >= reserved_register || dest >= reserved_register ||
