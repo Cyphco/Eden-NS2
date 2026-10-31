@@ -414,19 +414,35 @@ std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias,
     }
     // A base pointer survives addition and selection, but not multiplication or a
     // predicate calculation. Searching those expressions can find strides first.
-    small_vector<const IR::Inst*, 16> pending;
-    const auto enqueue = [&](const IR::Value& candidate) {
+    // The search is ordered by cost: one per operation, nothing for the latest incoming value
+    // of a phi and a large penalty for its older ones. A predicated definition merges with the
+    // previous value of a reused register, which can hold an unrelated pointer; the scratch
+    // registers of a lowered instruction add phis of their own between the new pointer and the
+    // address. Counting phis as levels would find the older pointer first.
+    constexpr u32 older_incoming_cost = 64;
+    struct Candidate {
+        u32 cost;
+        const IR::Inst* inst;
+    };
+    small_vector<Candidate, 32> frontier;
+    small_vector<const IR::Inst*, 32> visited;
+    const auto enqueue = [&](const IR::Value& candidate, u32 cost) {
         if (candidate.IsImmediate()) return;
         const auto* candidate_inst = candidate.InstRecursive();
-        if (std::ranges::find(pending, candidate_inst) == pending.end()) {
-            pending.push_back(candidate_inst);
+        if (std::ranges::find(visited, candidate_inst) == visited.end()) {
+            frontier.push_back({cost, candidate_inst});
         }
     };
     const auto pointer_search = [&](bool relaxed) -> std::optional<StorageBufferAddr> {
-        pending.clear();
-        enqueue(value);
-        for (size_t next = 0; next < pending.size(); ++next) {
-            const auto* inst = pending[next];
+        frontier.clear();
+        visited.clear();
+        enqueue(value, 0);
+        while (!frontier.empty()) {
+            const auto cheapest = std::ranges::min_element(frontier, {}, &Candidate::cost);
+            const auto [cost, inst] = *cheapest;
+            frontier.erase(cheapest);
+            if (std::ranges::find(visited, inst) != visited.end()) continue;
+            visited.push_back(inst);
             if (const auto result = pred(inst)) return result;
             // A 64-bit constant buffer read added straight into the address is the base pointer,
             // even when its slot does not hold a mapped pointer yet when the shader is built.
@@ -436,16 +452,20 @@ std::optional<StorageBufferAddr> Track(const IR::Value& value, const Bias* bias,
             }
             switch (inst->GetOpcode()) {
             case IR::Opcode::IAdd32:
+                for (size_t arg = inst->NumArgs(); arg--;) enqueue(inst->Arg(arg), cost + 1);
+                break;
             case IR::Opcode::Phi:
-                for (size_t arg = inst->NumArgs(); arg--;) enqueue(inst->Arg(arg));
+                for (size_t arg = inst->NumArgs(); arg--;) {
+                    enqueue(inst->Arg(arg), arg + 1 == inst->NumArgs() ? cost : cost + older_incoming_cost);
+                }
                 break;
             case IR::Opcode::SelectU32:
-                enqueue(inst->Arg(1));
-                enqueue(inst->Arg(2));
+                enqueue(inst->Arg(1), cost + 1);
+                enqueue(inst->Arg(2), cost + 1);
                 break;
             case IR::Opcode::CompositeExtractU32x2:
                 if (inst->Arg(1).IsImmediate() && inst->Arg(1).U32() == 0) {
-                    enqueue(inst->Arg(0));
+                    enqueue(inst->Arg(0), cost + 1);
                 }
                 break;
             default:
